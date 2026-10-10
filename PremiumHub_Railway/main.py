@@ -29,8 +29,9 @@ from aiogram import Bot, Dispatcher, F, Router
 
 from aiogram.client.default import DefaultBotProperties
 
-from aiogram.enums import ParseMode
+from aiogram.enums import ChatMemberStatus, ParseMode
 
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram.filters import Command
 
 from aiogram.fsm.context import FSMContext
@@ -84,6 +85,11 @@ ADMIN_IDS = {
 CARD_NUMBER = os.getenv("CARD_NUMBER", "KARTA_RAQAMINI_KIRITING").strip()
 
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "@Starsoson_bot").strip()
+
+REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "").strip()
+FORCE_SUB_ENABLED_DEFAULT = os.getenv("FORCE_SUB_ENABLED", "false").strip().lower() in {
+    "1", "true", "yes", "on"
+}
 
 LOG_CHAT_ID = int(os.getenv("LOG_CHAT_ID", "0") or 0)
 
@@ -200,10 +206,11 @@ router = Router()
 
 
 class Flow(StatesGroup):
-
     stars = State()
-
     username = State()
+    broadcast = State()
+    admin_price = State()
+    admin_channel = State()
 
 
 
@@ -293,23 +300,19 @@ def recipient_kb() -> InlineKeyboardMarkup:
 
 
 
-def premium_kb() -> InlineKeyboardMarkup:
-
+def premium_kb(prices: dict[int, int] | None = None) -> InlineKeyboardMarkup:
+    p = prices or PREMIUM
     return InlineKeyboardMarkup(
-
         inline_keyboard=[
-
-            [b(f"💎 3 oy — {money(PREMIUM[3])} so'm", "premium:3")],
-
-            [b(f"💎 6 oy — {money(PREMIUM[6])} so'm", "premium:6")],
-
-            [b(f"👑 12 oy — {money(PREMIUM[12])} so'm", "premium:12")],
-
+            [b(f"💎 3 oy — {money(p[3])} so'm", "premium:3")],
+            [b(f"💎 6 oy — {money(p[6])} so'm", "premium:6")],
+            [b(f"👑 12 oy — {money(p[12])} so'm", "premium:12")],
             [b("↩️ Orqaga", "menu:main", "danger")],
-
         ]
-
     )
+
+
+
 
 
 
@@ -376,34 +379,54 @@ def review_kb(ref: str) -> InlineKeyboardMarkup:
 
 
 def admin_panel_kb(enabled: bool = True) -> InlineKeyboardMarkup:
-
     toggle = (
-
         ("⛔ Botni o‘chirish", "admin:toggle:off", "danger")
-
         if enabled
-
         else ("✅ Botni yoqish", "admin:toggle:on", "success")
-
     )
-
     return InlineKeyboardMarkup(
-
         inline_keyboard=[
-
             [b("📊 Statistika", "admin:stats"), b("📦 Buyurtmalar", "admin:orders")],
-
-            [b("👥 Foydalanuvchilar", "admin:users"), b("📢 Log test", "admin:logtest")],
-
+            [b("👥 Foydalanuvchilar", "admin:users"), b("📣 Ommaviy xabar", "admin:broadcast")],
+            [b("💰 Narxlarni o‘zgartirish", "admin:prices", "primary")],
+            [b("📢 Kanal sozlamalari", "admin:channel", "primary"), b("👑 VIP tizimi", "admin:vip", "primary")],
             [b("💳 Avto-to'lov holati", "admin:autopay", "primary")],
-
             [b(*toggle)],
-
             [b("🏠 Bosh menyu", "menu:main", "primary")],
-
         ]
-
     )
+
+
+def admin_back_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[b("↩️ Admin", "admin:panel", "danger")]]
+    )
+
+
+def broadcast_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [b("✍️ Ommaviy xabar yozish", "admin:broadcast:custom", "primary")],
+            [
+                b("🟢 Bot ochildi", "admin:broadcast:open", "success"),
+                b("🔴 Bot yopildi", "admin:broadcast:closed", "danger"),
+            ],
+            [b("↩️ Admin", "admin:panel", "danger")],
+        ]
+    )
+
+
+def subscription_kb(channel: str) -> InlineKeyboardMarkup:
+    username = channel.lstrip("@")
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📢 Kanalga obuna bo‘lish", url=f"https://t.me/{username}")],
+            [b("✅ Tekshirish", "sub:check", "success")],
+        ]
+    )
+
+
+
 
 
 
@@ -495,6 +518,20 @@ async def db_init() -> None:
 
 
 
+        defaults = {
+            "price_stars": STAR_PRICE_UZS,
+            "price_p3": PREMIUM[3],
+            "price_p6": PREMIUM[6],
+            "price_p12": PREMIUM[12],
+            "required_channel": REQUIRED_CHANNEL,
+            "force_sub_enabled": "1" if FORCE_SUB_ENABLED_DEFAULT else "0",
+        }
+        for key, value in defaults.items():
+            await db.execute(
+                "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
+                (key, str(value)),
+            )
+
         # Eski bazani o'chirmasdan avto-to'lov ustunlarini qo'shamiz.
 
         cur = await db.execute("PRAGMA table_info(orders)")
@@ -556,20 +593,139 @@ async def setting(key: str, default: str = "") -> str:
 
 
 async def set_setting(key: str, value: str) -> None:
-
     async with db_connect() as db:
-
         await db.execute(
-
             """INSERT INTO settings(key,value) VALUES(?,?)
-
                ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
-
             (key, str(value)),
-
         )
-
         await db.commit()
+
+
+async def current_star_price() -> int:
+    try:
+        return max(1, int(await setting("price_stars", str(STAR_PRICE_UZS))))
+    except (TypeError, ValueError):
+        return STAR_PRICE_UZS
+
+
+async def current_premium_prices() -> dict[int, int]:
+    result: dict[int, int] = {}
+    for months, key in ((3, "price_p3"), (6, "price_p6"), (12, "price_p12")):
+        try:
+            result[months] = max(1, int(await setting(key, str(PREMIUM[months]))))
+        except (TypeError, ValueError):
+            result[months] = PREMIUM[months]
+    return result
+
+
+def vip_info(total_spent: int) -> tuple[str, int]:
+    if total_spent >= 1_000_000:
+        return "👑 VIP", 3
+    if total_spent >= 500_000:
+        return "🥇 Gold", 2
+    if total_spent >= 200_000:
+        return "🥈 Silver", 1
+    return "⭐ Oddiy", 0
+
+
+async def required_channel_settings() -> tuple[bool, str]:
+    enabled = await setting(
+        "force_sub_enabled",
+        "1" if FORCE_SUB_ENABLED_DEFAULT else "0",
+    ) == "1"
+    channel = (await setting("required_channel", REQUIRED_CHANNEL)).strip()
+    return enabled, channel
+
+
+async def is_channel_member(bot: Bot, user_id: int) -> bool:
+    if user_id in ADMIN_IDS:
+        return True
+    enabled, channel = await required_channel_settings()
+    if not enabled or not channel:
+        return True
+    try:
+        member = await bot.get_chat_member(channel, user_id)
+        return member.status not in {ChatMemberStatus.LEFT, ChatMemberStatus.KICKED}
+    except Exception:
+        log.exception("Majburiy obuna tekshiruvida xato: %s", channel)
+        return True
+
+
+async def require_subscription_message(m: Message, bot: Bot) -> bool:
+    if await is_channel_member(bot, m.from_user.id):
+        return True
+    _, channel = await required_channel_settings()
+    await m.answer(
+        f"📢 <b>Botdan foydalanish uchun kanalga obuna bo‘ling.</b>\n\n"
+        f"Kanal: <b>{channel}</b>\n"
+        f"Obuna bo‘lgach <b>✅ Tekshirish</b> tugmasini bosing.",
+        reply_markup=subscription_kb(channel),
+    )
+    return False
+
+
+async def require_subscription_callback(c: CallbackQuery, bot: Bot) -> bool:
+    if await is_channel_member(bot, c.from_user.id):
+        return True
+    _, channel = await required_channel_settings()
+    await c.message.edit_text(
+        f"📢 <b>Botdan foydalanish uchun kanalga obuna bo‘ling.</b>\n\n"
+        f"Kanal: <b>{channel}</b>\n"
+        f"Obuna bo‘lgach <b>✅ Tekshirish</b> tugmasini bosing.",
+        reply_markup=subscription_kb(channel),
+    )
+    await c.answer("Avval kanalga obuna bo‘ling.", show_alert=True)
+    return False
+
+
+async def all_user_ids() -> list[int]:
+    async with db_connect() as db:
+        rows = await (await db.execute("SELECT telegram_id FROM users")).fetchall()
+    return [int(row[0]) for row in rows if row[0]]
+
+
+async def broadcast_copy(bot: Bot, from_chat_id: int, message_id: int) -> tuple[int, int]:
+    ok = 0
+    fail = 0
+    for user_id in await all_user_ids():
+        try:
+            await bot.copy_message(user_id, from_chat_id, message_id)
+            ok += 1
+            await asyncio.sleep(0.055)
+        except TelegramRetryAfter as exc:
+            await asyncio.sleep(float(exc.retry_after) + 0.5)
+            try:
+                await bot.copy_message(user_id, from_chat_id, message_id)
+                ok += 1
+            except Exception:
+                fail += 1
+        except Exception:
+            fail += 1
+    return ok, fail
+
+
+async def broadcast_text(bot: Bot, text: str) -> tuple[int, int]:
+    ok = 0
+    fail = 0
+    for user_id in await all_user_ids():
+        try:
+            await bot.send_message(user_id, text)
+            ok += 1
+            await asyncio.sleep(0.055)
+        except TelegramRetryAfter as exc:
+            await asyncio.sleep(float(exc.retry_after) + 0.5)
+            try:
+                await bot.send_message(user_id, text)
+                ok += 1
+            except Exception:
+                fail += 1
+        except Exception:
+            fail += 1
+    return ok, fail
+
+
+
 
 
 
@@ -916,26 +1072,25 @@ async def fragment(kind: str, user: str, value: int) -> dict:
 
 
 async def home_text(u) -> str:
-
     uid = await upsert_user(u)
-
     cnt, total = await user_stats(u.id)
+    vip_name, vip_discount = vip_info(total)
+    vip_line = f"👑 Daraja: <b>{vip_name}</b>"
+    if vip_discount:
+        vip_line += f" — <b>{vip_discount}% chegirma</b>"
 
     return (
-
         f"👋 <b>Assalomu alaykum, {u.first_name or 'Foydalanuvchi'}!</b>\n\n"
-
-        f"PremiumHubga xush kelibsiz!\n\n"
-
-        f"🆔 PremiumHub ID: <b>{uid}</b>\n"
-
+        f"StarsOson botga xush kelibsiz!\n\n"
+        f"🆔 StarsOson ID: <b>{uid}</b>\n"
         f"💰 Xaridlar: <b>{money(total)} so'm</b>\n"
-
-        f"📦 Buyurtmalar: <b>{cnt} ta</b>\n\n"
-
+        f"📦 Buyurtmalar: <b>{cnt} ta</b>\n"
+        f"{vip_line}\n\n"
         f"🛡 Kerakli bo'limni tanlang:"
-
     )
+
+
+
 
 
 
@@ -947,6 +1102,17 @@ async def ensure_enabled(c: CallbackQuery) -> bool:
 
         return True
 
+
+
+@router.callback_query(F.data == "sub:check")
+async def subscription_check(c: CallbackQuery, bot: Bot):
+    if await is_channel_member(bot, c.from_user.id):
+        await c.message.edit_text(
+            await home_text(c.from_user),
+            reply_markup=main_kb(c.from_user.id in ADMIN_IDS),
+        )
+        return await c.answer("✅ Obuna tasdiqlandi.")
+    await c.answer("❌ Hali kanalga obuna bo‘lmagansiz.", show_alert=True)
     if await setting("bot_enabled", "1") != "1":
 
         await c.answer("⛔ Bot vaqtincha texnik xizmatda.", show_alert=True)
@@ -1635,7 +1801,7 @@ async def order_sweeper(bot: Bot) -> None:
 
 @router.message(Command("start"))
 
-async def start(m: Message, state: FSMContext):
+async def start(m: Message, state: FSMContext, bot: Bot):
 
     await state.clear()
 
@@ -1648,6 +1814,10 @@ async def start(m: Message, state: FSMContext):
             "⛔ Bot vaqtincha texnik xizmatda. Keyinroq urinib ko‘ring."
 
         )
+
+    
+    if not await require_subscription_message(m, bot):
+        return
 
     await m.answer(
 
@@ -1663,9 +1833,12 @@ async def start(m: Message, state: FSMContext):
 
 @router.callback_query(F.data == "menu:main")
 
-async def home(c: CallbackQuery, state: FSMContext):
+async def home(c: CallbackQuery, state: FSMContext, bot: Bot):
 
     await state.clear()
+
+    if not await require_subscription_callback(c, bot):
+        return
 
     await c.message.edit_text(
 
@@ -1683,11 +1856,16 @@ async def home(c: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "menu:stars")
 
-async def stars(c: CallbackQuery, state: FSMContext):
+async def stars(c: CallbackQuery, state: FSMContext, bot: Bot):
 
     if not await ensure_enabled(c):
 
         return
+
+    if not await require_subscription_callback(c, bot):
+        return
+
+    star_price = await current_star_price()
 
     await state.set_state(Flow.stars)
 
@@ -1699,7 +1877,7 @@ async def stars(c: CallbackQuery, state: FSMContext):
 
         f"🟢 Maksimal: <b>{STAR_MAX} Stars</b>\n"
 
-        f"💰 1 Stars = <b>{money(STAR_PRICE_UZS)} so'm</b>\n\n"
+        f"💰 1 Stars = <b>{money(star_price)} so'm</b>\n\n"
 
         f"✍️ Kerakli miqdorni yuboring:",
 
@@ -1761,11 +1939,16 @@ async def stars_amount(m: Message, state: FSMContext):
 
 @router.callback_query(F.data == "menu:premium")
 
-async def premium_menu(c: CallbackQuery):
+async def premium_menu(c: CallbackQuery, bot: Bot):
 
     if not await ensure_enabled(c):
 
         return
+
+    if not await require_subscription_callback(c, bot):
+        return
+
+    prices = await current_premium_prices()
 
     await c.message.edit_text(
 
@@ -1777,7 +1960,7 @@ async def premium_menu(c: CallbackQuery):
 
         "Paketni tanlang:",
 
-        reply_markup=premium_kb(),
+        reply_markup=premium_kb(prices),
 
     )
 
@@ -1789,10 +1972,13 @@ async def premium_menu(c: CallbackQuery):
 
 @router.callback_query(F.data.startswith("premium:"))
 
-async def premium_pick(c: CallbackQuery, state: FSMContext):
+async def premium_pick(c: CallbackQuery, state: FSMContext, bot: Bot):
 
     if not await ensure_enabled(c):
 
+        return
+
+    if not await require_subscription_callback(c, bot):
         return
 
     value = int(c.data.split(":")[1])
@@ -1817,43 +2003,57 @@ async def premium_pick(c: CallbackQuery, state: FSMContext):
 
 
 
-async def show_confirm(target: str, ui, state: FSMContext, edit: bool = False):
-
+async def show_confirm(
+    target: str,
+    ui,
+    state: FSMContext,
+    buyer_id: int,
+    edit: bool = False,
+):
     data = await state.get_data()
-
     kind = data["kind"]
-
     value = int(data["value"])
 
-    amount = value * STAR_PRICE_UZS if kind == "stars" else PREMIUM[value]
+    if kind == "stars":
+        base_amount = value * await current_star_price()
+    else:
+        base_amount = (await current_premium_prices())[value]
 
+    _, total_spent = await user_stats(buyer_id)
+    vip_name, vip_discount = vip_info(total_spent)
+    amount = max(1, round(base_amount * (100 - vip_discount) / 100))
     product = f"{value} Stars" if kind == "stars" else f"Premium {value} oy"
 
-    await state.update_data(target=target, amount=amount)
+    await state.update_data(
+        target=target,
+        amount=amount,
+        base_amount=base_amount,
+        vip_discount=vip_discount,
+    )
 
-
+    discount_text = ""
+    if vip_discount:
+        discount_text = (
+            f"👑 {vip_name}: <b>{vip_discount}% chegirma</b>\n"
+            f"🏷 Oddiy narx: <s>{money(base_amount)} so'm</s>\n"
+        )
 
     text = (
-
         f"🧾 <b>Buyurtmani tekshiring</b>\n\n"
-
         f"📦 {product}\n"
-
         f"👤 Qabul qiluvchi: <b>@{target}</b>\n"
-
+        f"{discount_text}"
         f"💰 Narxi: <b>{money(amount)} so'm</b>\n\n"
-
         f"Ma'lumotlar to'g'rimi?"
-
     )
 
     if edit:
-
         await ui.edit_text(text, reply_markup=confirm_kb())
-
     else:
-
         await ui.answer(text, reply_markup=confirm_kb())
+
+
+
 
 
 
@@ -1873,7 +2073,7 @@ async def self_rec(c: CallbackQuery, state: FSMContext):
 
         )
 
-    await show_confirm(c.from_user.username, c.message, state, True)
+    await show_confirm(c.from_user.username, c.message, state, c.from_user.id, True)
 
     await c.answer()
 
@@ -1895,7 +2095,7 @@ async def username(m: Message, state: FSMContext):
 
         )
 
-    await show_confirm(username_value, m, state)
+    await show_confirm(username_value, m, state, m.from_user.id)
 
 
 
@@ -2020,26 +2220,17 @@ async def confirm(c: CallbackQuery, state: FSMContext, bot: Bot):
     )
 
     await c.message.edit_text(text, reply_markup=paid_kb(ref))
-
-    await log_event(
-
-        bot,
-
+    new_order_text = (
         f"🆕 <b>Yangi buyurtma</b>\n"
-
         f"🧾 <code>{ref}</code>\n"
-
         f"👤 {c.from_user.full_name} ({c.from_user.id})\n"
-
         f"📦 {product}\n"
-
         f"🎯 @{data['target']}\n"
-
         f"💰 Narx: {money(int(data['amount']))} so'm\n"
-
-        f"💳 To'lov summasi: {money(pay_amount)} so'm",
-
+        f"💳 To'lov summasi: {money(pay_amount)} so'm"
     )
+    await log_event(bot, new_order_text)
+    await admins(bot, new_order_text)
 
     await c.answer()
 
@@ -2258,32 +2449,26 @@ async def reject(c: CallbackQuery, bot: Bot):
 # ========================= PROFIL / YORDAM / ORDERS =========================
 
 @router.callback_query(F.data == "menu:profile")
-
 async def profile(c: CallbackQuery):
-
     uid = await upsert_user(c.from_user)
-
     cnt, total = await user_stats(c.from_user.id)
+    vip_name, vip_discount = vip_info(total)
+    vip_text = vip_name + (f" — {vip_discount}% chegirma" if vip_discount else "")
 
     await c.message.edit_text(
-
         f"👤 <b>Profil</b>\n\n"
-
-        f"🆔 PremiumHub ID: <b>{uid}</b>\n"
-
+        f"🆔 StarsOson ID: <b>{uid}</b>\n"
         f"👤 {c.from_user.full_name}\n"
-
         f"🔗 @{c.from_user.username or 'username yo‘q'}\n"
-
         f"📦 Buyurtmalar: <b>{cnt}</b>\n"
-
-        f"💰 Xaridlar: <b>{money(total)} so'm</b>",
-
+        f"💰 Xaridlar: <b>{money(total)} so'm</b>\n"
+        f"👑 Daraja: <b>{vip_text}</b>",
         reply_markup=back(),
-
     )
-
     await c.answer()
+
+
+
 
 
 
@@ -2436,7 +2621,7 @@ async def admin_cmd(m: Message):
 
     await m.answer(
 
-        f"🛡 <b>PremiumHub Admin</b>\n\n"
+        f"🛡 <b>StarsOson Admin</b>\n\n"
 
         f"Bot holati: {'🟢 ISHLAYAPTI' if enabled else '🔴 O‘CHIRILGAN'}",
 
@@ -2474,7 +2659,7 @@ async def admin_panel(c: CallbackQuery):
 
     await c.message.edit_text(
 
-        f"🛡 <b>PremiumHub Admin</b>\n\n"
+        f"🛡 <b>StarsOson Admin</b>\n\n"
 
         f"Bot holati: {'🟢 ISHLAYAPTI' if enabled else '🔴 O‘CHIRILGAN'}",
 
@@ -2514,6 +2699,373 @@ async def admin_autopay(c: CallbackQuery):
 
 
 
+
+# ====================== YANGI ADMIN FUNKSIYALAR ======================
+
+async def price_admin_text() -> str:
+    star_price = await current_star_price()
+    premium_prices = await current_premium_prices()
+    return (
+        "💰 <b>Narxlarni boshqarish</b>\n\n"
+        f"⭐ 1 Stars: <b>{money(star_price)} so'm</b>\n"
+        f"💎 Premium 3 oy: <b>{money(premium_prices[3])} so'm</b>\n"
+        f"💎 Premium 6 oy: <b>{money(premium_prices[6])} so'm</b>\n"
+        f"👑 Premium 12 oy: <b>{money(premium_prices[12])} so'm</b>\n\n"
+        "O‘zgartirmoqchi bo‘lgan narxni tanlang:"
+    )
+
+
+def price_admin_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [b("⭐ 1 Stars", "admin:price:stars", "primary")],
+            [b("💎 3 oy", "admin:price:p3", "primary"), b("💎 6 oy", "admin:price:p6", "primary")],
+            [b("👑 12 oy", "admin:price:p12", "primary")],
+            [b("↩️ Admin", "admin:panel", "danger")],
+        ]
+    )
+
+
+@router.callback_query(F.data == "admin:prices")
+async def admin_prices(c: CallbackQuery, state: FSMContext):
+    if c.from_user.id not in ADMIN_IDS:
+        return await c.answer("Ruxsat yo‘q.", show_alert=True)
+    await state.clear()
+    await c.message.edit_text(await price_admin_text(), reply_markup=price_admin_kb())
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("admin:price:"))
+async def admin_price_pick(c: CallbackQuery, state: FSMContext):
+    if c.from_user.id not in ADMIN_IDS:
+        return await c.answer("Ruxsat yo‘q.", show_alert=True)
+
+    code = c.data.rsplit(":", 1)[1]
+    mapping = {
+        "stars": ("price_stars", "⭐ 1 Stars"),
+        "p3": ("price_p3", "💎 Premium 3 oy"),
+        "p6": ("price_p6", "💎 Premium 6 oy"),
+        "p12": ("price_p12", "👑 Premium 12 oy"),
+    }
+    if code not in mapping:
+        return await c.answer("Noto‘g‘ri tanlov.", show_alert=True)
+
+    key, title = mapping[code]
+    await state.set_state(Flow.admin_price)
+    await state.update_data(admin_price_key=key, admin_price_title=title)
+    await c.message.edit_text(
+        f"💰 <b>{title}</b>\n\n"
+        "Yangi narxni faqat raqamda yuboring.\n"
+        "Masalan: <code>210</code> yoki <code>165000</code>",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[b("❌ Bekor qilish", "admin:prices", "danger")]]
+        ),
+    )
+    await c.answer()
+
+
+@router.message(Flow.admin_price)
+async def admin_price_value(m: Message, state: FSMContext):
+    if m.from_user.id not in ADMIN_IDS:
+        return
+    raw = re.sub(r"\D", "", m.text or "")
+    if not raw:
+        return await m.answer("❌ Narxni faqat raqamda yuboring.")
+    value = int(raw)
+    if value <= 0:
+        return await m.answer("❌ Narx 0 dan katta bo‘lishi kerak.")
+
+    data = await state.get_data()
+    key = data.get("admin_price_key")
+    title = data.get("admin_price_title", "Narx")
+    if key not in {"price_stars", "price_p3", "price_p6", "price_p12"}:
+        await state.clear()
+        return await m.answer("❌ Sozlama topilmadi. /admin ni qayta oching.")
+
+    await set_setting(key, str(value))
+    await state.clear()
+    await m.answer(
+        f"✅ <b>{title}</b> yangi narxi: <b>{money(value)} so'm</b>",
+        reply_markup=admin_back_kb(),
+    )
+
+
+@router.callback_query(F.data == "admin:broadcast")
+async def admin_broadcast(c: CallbackQuery, state: FSMContext):
+    if c.from_user.id not in ADMIN_IDS:
+        return await c.answer("Ruxsat yo‘q.", show_alert=True)
+    await state.clear()
+    await c.message.edit_text(
+        "📣 <b>Ommaviy xabar</b>\n\n"
+        "Matn, rasm, video yoki boshqa postni barcha foydalanuvchilarga yuborishingiz mumkin.\n"
+        "Yoki bot ochildi/yopildi tezkor xabaridan foydalaning.",
+        reply_markup=broadcast_menu_kb(),
+    )
+    await c.answer()
+
+
+@router.callback_query(F.data == "admin:broadcast:custom")
+async def admin_broadcast_custom(c: CallbackQuery, state: FSMContext):
+    if c.from_user.id not in ADMIN_IDS:
+        return await c.answer("Ruxsat yo‘q.", show_alert=True)
+    await state.set_state(Flow.broadcast)
+    await c.message.edit_text(
+        "✍️ <b>Ommaviy yuboriladigan xabarni yuboring.</b>\n\n"
+        "Matn, rasm, video yoki post bo‘lishi mumkin.\n"
+        "Avval preview ko‘rsatiladi, keyin tasdiqlaysiz.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[b("❌ Bekor qilish", "admin:broadcast:cancel", "danger")]]
+        ),
+    )
+    await c.answer()
+
+
+@router.message(Flow.broadcast)
+async def admin_broadcast_receive(m: Message, state: FSMContext, bot: Bot):
+    if m.from_user.id not in ADMIN_IDS:
+        return
+    await state.update_data(
+        broadcast_chat_id=m.chat.id,
+        broadcast_message_id=m.message_id,
+    )
+    await bot.copy_message(m.chat.id, m.chat.id, m.message_id)
+    await m.answer(
+        "👆 <b>Preview</b>\n\nShu xabarni barcha foydalanuvchilarga yuboraymi?",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [b("✅ Hammaga yuborish", "admin:broadcast:confirm", "success")],
+                [b("❌ Bekor qilish", "admin:broadcast:cancel", "danger")],
+            ]
+        ),
+    )
+
+
+@router.callback_query(F.data == "admin:broadcast:cancel")
+async def admin_broadcast_cancel(c: CallbackQuery, state: FSMContext):
+    if c.from_user.id not in ADMIN_IDS:
+        return await c.answer("Ruxsat yo‘q.", show_alert=True)
+    await state.clear()
+    await c.message.edit_text("❌ Ommaviy xabar bekor qilindi.", reply_markup=admin_back_kb())
+    await c.answer()
+
+
+@router.callback_query(F.data == "admin:broadcast:confirm")
+async def admin_broadcast_confirm(c: CallbackQuery, state: FSMContext, bot: Bot):
+    if c.from_user.id not in ADMIN_IDS:
+        return await c.answer("Ruxsat yo‘q.", show_alert=True)
+    data = await state.get_data()
+    from_chat_id = data.get("broadcast_chat_id")
+    message_id = data.get("broadcast_message_id")
+    if not from_chat_id or not message_id:
+        await state.clear()
+        return await c.answer("Xabar topilmadi. Qaytadan urinib ko‘ring.", show_alert=True)
+
+    await c.answer("Yuborish boshlandi.")
+    await c.message.edit_text("📤 <b>Ommaviy xabar yuborilmoqda...</b>")
+    ok, fail = await broadcast_copy(bot, int(from_chat_id), int(message_id))
+    await state.clear()
+    await c.message.edit_text(
+        f"✅ <b>Ommaviy xabar yakunlandi</b>\n\n"
+        f"✅ Yuborildi: <b>{ok} ta</b>\n"
+        f"❌ Yetmadi: <b>{fail} ta</b>",
+        reply_markup=admin_back_kb(),
+    )
+
+
+@router.callback_query(F.data.in_({"admin:broadcast:open", "admin:broadcast:closed"}))
+async def admin_broadcast_status_preview(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS:
+        return await c.answer("Ruxsat yo‘q.", show_alert=True)
+    is_open = c.data.endswith(":open")
+    text = (
+        "🟢 <b>StarsOson bot yana ishga tushdi!</b>\n\n"
+        "⭐ Stars va 💎 Premium xaridlarini bot orqali 24/7 amalga oshirishingiz mumkin.\n\n"
+        "👇 Xarid qilish uchun /start"
+        if is_open
+        else
+        "🔴 <b>StarsOson bot vaqtincha yopildi.</b>\n\n"
+        "🛠 Texnik ishlar olib borilmoqda. Bot qayta ishga tushganda xabar beramiz."
+    )
+    action = "open" if is_open else "closed"
+    await c.message.edit_text(
+        f"{text}\n\n<b>Bu xabar barcha foydalanuvchilarga yuboriladi.</b>",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [b("✅ Tasdiqlash", f"admin:broadcast:status:{action}", "success")],
+                [b("❌ Bekor qilish", "admin:broadcast", "danger")],
+            ]
+        ),
+    )
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("admin:broadcast:status:"))
+async def admin_broadcast_status_send(c: CallbackQuery, bot: Bot):
+    if c.from_user.id not in ADMIN_IDS:
+        return await c.answer("Ruxsat yo‘q.", show_alert=True)
+
+    action = c.data.rsplit(":", 1)[1]
+    is_open = action == "open"
+    text = (
+        "🟢 <b>StarsOson bot yana ishga tushdi!</b>\n\n"
+        "⭐ Stars va 💎 Premium xaridlarini bot orqali 24/7 amalga oshirishingiz mumkin.\n\n"
+        "👇 Xarid qilish uchun /start"
+        if is_open
+        else
+        "🔴 <b>StarsOson bot vaqtincha yopildi.</b>\n\n"
+        "🛠 Texnik ishlar olib borilmoqda. Bot qayta ishga tushganda xabar beramiz."
+    )
+
+    await set_setting("bot_enabled", "1" if is_open else "0")
+    await c.answer("Yuborish boshlandi.")
+    await c.message.edit_text("📤 <b>Status xabari yuborilmoqda...</b>")
+    ok, fail = await broadcast_text(bot, text)
+    await c.message.edit_text(
+        f"{'🟢 Bot yoqildi.' if is_open else '🔴 Bot o‘chirildi.'}\n\n"
+        f"✅ Yuborildi: <b>{ok} ta</b>\n"
+        f"❌ Yetmadi: <b>{fail} ta</b>",
+        reply_markup=admin_back_kb(),
+    )
+
+
+@router.callback_query(F.data == "admin:channel")
+async def admin_channel(c: CallbackQuery, state: FSMContext):
+    if c.from_user.id not in ADMIN_IDS:
+        return await c.answer("Ruxsat yo‘q.", show_alert=True)
+
+    await state.clear()
+    enabled, channel = await required_channel_settings()
+    await c.message.edit_text(
+        "📢 <b>Majburiy kanal obunasi</b>\n\n"
+        f"Holat: <b>{'✅ YOQILGAN' if enabled else '❌ O‘CHIRILGAN'}</b>\n"
+        f"Kanal: <b>{channel or 'kiritilmagan'}</b>\n\n"
+        "⚠️ Obunani aniq tekshirish uchun bot kanalda administrator bo‘lishi kerak.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [b("✏️ Kanalni o‘zgartirish", "admin:channel:set", "primary")],
+                [b("✅ Yoqish", "admin:channel:on", "success"), b("⛔ O‘chirish", "admin:channel:off", "danger")],
+                [b("↩️ Admin", "admin:panel", "danger")],
+            ]
+        ),
+    )
+    await c.answer()
+
+
+@router.callback_query(F.data == "admin:channel:set")
+async def admin_channel_set(c: CallbackQuery, state: FSMContext):
+    if c.from_user.id not in ADMIN_IDS:
+        return await c.answer("Ruxsat yo‘q.", show_alert=True)
+    await state.set_state(Flow.admin_channel)
+    await c.message.edit_text(
+        "📢 Kanal username'ini yuboring.\n\n"
+        "Masalan: <code>@starsoson</code>\n"
+        "Kanal public bo‘lishi kerak.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[b("❌ Bekor qilish", "admin:channel", "danger")]]
+        ),
+    )
+    await c.answer()
+
+
+@router.message(Flow.admin_channel)
+async def admin_channel_value(m: Message, state: FSMContext, bot: Bot):
+    if m.from_user.id not in ADMIN_IDS:
+        return
+
+    value = (m.text or "").strip()
+    if value.startswith("https://t.me/"):
+        value = "@" + value.rstrip("/").rsplit("/", 1)[-1]
+    if not value.startswith("@"):
+        value = "@" + value
+    if not re.fullmatch(r"@[A-Za-z0-9_]{5,32}", value):
+        return await m.answer("❌ Kanal username noto‘g‘ri. Masalan: <code>@starsoson</code>")
+
+    try:
+        await bot.get_chat(value)
+    except Exception:
+        return await m.answer("❌ Bot bu kanalni topolmadi. Username to‘g‘riligini tekshiring.")
+
+    await set_setting("required_channel", value)
+    await state.clear()
+    await m.answer(
+        f"✅ Majburiy obuna kanali saqlandi: <b>{value}</b>\n\n"
+        "Endi botni shu kanalga administrator qiling, so‘ng admin paneldan obunani yoqing.",
+        reply_markup=admin_back_kb(),
+    )
+
+
+@router.callback_query(F.data.in_({"admin:channel:on", "admin:channel:off"}))
+async def admin_channel_toggle(c: CallbackQuery, bot: Bot):
+    if c.from_user.id not in ADMIN_IDS:
+        return await c.answer("Ruxsat yo‘q.", show_alert=True)
+
+    on = c.data.endswith(":on")
+    _, channel = await required_channel_settings()
+    if on and not channel:
+        return await c.answer("Avval kanal username'ini kiriting.", show_alert=True)
+
+    if on:
+        try:
+            me = await bot.get_me()
+            member = await bot.get_chat_member(channel, me.id)
+            if member.status not in {ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR}:
+                return await c.answer("Avval botni kanalda administrator qiling.", show_alert=True)
+        except Exception:
+            return await c.answer(
+                "Kanalni tekshirib bo‘lmadi. Botni kanalda admin qiling.",
+                show_alert=True,
+            )
+
+    await set_setting("force_sub_enabled", "1" if on else "0")
+    await c.answer("✅ Saqlandi.")
+    enabled, channel = await required_channel_settings()
+    await c.message.edit_text(
+        "📢 <b>Majburiy kanal obunasi</b>\n\n"
+        f"Holat: <b>{'✅ YOQILGAN' if enabled else '❌ O‘CHIRILGAN'}</b>\n"
+        f"Kanal: <b>{channel or 'kiritilmagan'}</b>",
+        reply_markup=admin_back_kb(),
+    )
+
+
+@router.callback_query(F.data == "admin:vip")
+async def admin_vip(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS:
+        return await c.answer("Ruxsat yo‘q.", show_alert=True)
+
+    async with db_connect() as db:
+        rows = await (
+            await db.execute(
+                """
+                SELECT u.telegram_id, u.first_name, u.username,
+                       COALESCE(SUM(CASE WHEN o.status='completed' THEN o.amount_uzs ELSE 0 END),0) AS total
+                FROM users u
+                LEFT JOIN orders o ON o.telegram_id=u.telegram_id
+                GROUP BY u.telegram_id, u.first_name, u.username
+                ORDER BY total DESC
+                LIMIT 10
+                """
+            )
+        ).fetchall()
+
+    top_lines = []
+    for idx, row in enumerate(rows, 1):
+        level, _ = vip_info(int(row[3] or 0))
+        name = row[1] or row[2] or str(row[0])
+        top_lines.append(f"{idx}. {name} — <b>{money(int(row[3] or 0))} so'm</b> — {level}")
+
+    await c.message.edit_text(
+        "👑 <b>VIP tizimi</b>\n\n"
+        "⭐ Oddiy: 0 — 199 999 so‘m, 0%\n"
+        "🥈 Silver: 200 000+ so‘m, 1%\n"
+        "🥇 Gold: 500 000+ so‘m, 2%\n"
+        "👑 VIP: 1 000 000+ so‘m, 3%\n\n"
+        "<b>TOP xaridorlar:</b>\n"
+        + ("\n".join(top_lines) if top_lines else "Hali xaridorlar yo‘q."),
+        reply_markup=admin_back_kb(),
+    )
+    await c.answer()
+
+
 @router.callback_query(F.data.startswith("admin:toggle:"))
 
 async def toggle(c: CallbackQuery, bot: Bot):
@@ -2536,7 +3088,7 @@ async def toggle(c: CallbackQuery, bot: Bot):
 
     await c.message.edit_text(
 
-        f"🛡 <b>PremiumHub Admin</b>\n\n"
+        f"🛡 <b>StarsOson Admin</b>\n\n"
 
         f"Bot holati: {'🟢 ISHLAYAPTI' if on else '🔴 O‘CHIRILGAN'}",
 
