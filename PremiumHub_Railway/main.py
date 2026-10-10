@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 
+import html
+
 import json
 
 import logging
@@ -219,6 +221,11 @@ class Flow(StatesGroup):
 def money(v: int) -> str:
 
     return f"{v:,}".replace(",", " ")
+
+
+def esc(value) -> str:
+    """Telegram HTML parse_mode uchun tashqi matnni xavfsiz qiladi."""
+    return html.escape(str(value or ""), quote=False)
 
 
 
@@ -1080,7 +1087,7 @@ async def home_text(u) -> str:
         vip_line += f" — <b>{vip_discount}% chegirma</b>"
 
     return (
-        f"👋 <b>Assalomu alaykum, {u.first_name or 'Foydalanuvchi'}!</b>\n\n"
+        f"👋 <b>Assalomu alaykum, {esc(u.first_name or 'Foydalanuvchi')}!</b>\n\n"
         f"StarsOson botga xush kelibsiz!\n\n"
         f"🆔 StarsOson ID: <b>{uid}</b>\n"
         f"💰 Xaridlar: <b>{money(total)} so'm</b>\n"
@@ -1108,8 +1115,13 @@ async def ensure_enabled(c: CallbackQuery) -> bool:
 
 
 @router.callback_query(F.data == "sub:check")
-async def subscription_check(c: CallbackQuery, bot: Bot):
+async def subscription_check(c: CallbackQuery, bot: Bot, state: FSMContext):
+    if not await ensure_enabled(c):
+        return
+
     if await is_channel_member(bot, c.from_user.id):
+        # Oldingi Stars/Premium FSM holati tasodifan davom etib ketmasin.
+        await state.clear()
         await c.message.edit_text(
             await home_text(c.from_user),
             reply_markup=main_kb(c.from_user.id in ADMIN_IDS),
@@ -1228,9 +1240,9 @@ async def deliver(bot: Bot, ref: str) -> None:
 
         )
 
-        await admins(bot, f"🚨 DELIVERY FAILED <code>{ref}</code>\n{err}")
+        await admins(bot, f"🚨 DELIVERY FAILED <code>{ref}</code>\n{esc(err)}")
 
-        await log_event(bot, f"🚨 Yetkazish xatosi <code>{ref}</code>\n{err}")
+        await log_event(bot, f"🚨 Yetkazish xatosi <code>{ref}</code>\n{esc(err)}")
 
 
 
@@ -1834,6 +1846,9 @@ async def home(c: CallbackQuery, state: FSMContext, bot: Bot):
 
     await state.clear()
 
+    if not await ensure_enabled(c):
+        return
+
     if not await require_subscription_callback(c, bot):
         return
 
@@ -1890,7 +1905,14 @@ async def stars(c: CallbackQuery, state: FSMContext, bot: Bot):
 
 @router.message(Flow.stars)
 
-async def stars_amount(m: Message, state: FSMContext):
+async def stars_amount(m: Message, state: FSMContext, bot: Bot):
+
+    if await setting("bot_enabled", "1") != "1" and m.from_user.id not in ADMIN_IDS:
+        await state.clear()
+        return await m.answer("⛔ Bot vaqtincha texnik xizmatda.")
+
+    if not await require_subscription_message(m, bot):
+        return
 
     try:
 
@@ -2058,7 +2080,12 @@ async def show_confirm(
 
 @router.callback_query(F.data == "recipient:self")
 
-async def self_rec(c: CallbackQuery, state: FSMContext):
+async def self_rec(c: CallbackQuery, state: FSMContext, bot: Bot):
+
+    if not await ensure_enabled(c):
+        return
+    if not await require_subscription_callback(c, bot):
+        return
 
     if not c.from_user.username:
 
@@ -2080,7 +2107,14 @@ async def self_rec(c: CallbackQuery, state: FSMContext):
 
 @router.message(Flow.username)
 
-async def username(m: Message, state: FSMContext):
+async def username(m: Message, state: FSMContext, bot: Bot):
+
+    if await setting("bot_enabled", "1") != "1" and m.from_user.id not in ADMIN_IDS:
+        await state.clear()
+        return await m.answer("⛔ Bot vaqtincha texnik xizmatda.")
+
+    if not await require_subscription_message(m, bot):
+        return
 
     username_value = (m.text or "").strip().lstrip("@")
 
@@ -2141,6 +2175,11 @@ async def abort(c: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "order:confirm")
 
 async def confirm(c: CallbackQuery, state: FSMContext, bot: Bot):
+
+    if not await ensure_enabled(c):
+        return
+    if not await require_subscription_callback(c, bot):
+        return
 
     data = await state.get_data()
 
@@ -2220,7 +2259,7 @@ async def confirm(c: CallbackQuery, state: FSMContext, bot: Bot):
     new_order_text = (
         f"🆕 <b>Yangi buyurtma</b>\n"
         f"🧾 <code>{ref}</code>\n"
-        f"👤 {c.from_user.full_name} ({c.from_user.id})\n"
+        f"👤 {esc(c.from_user.full_name)} ({c.from_user.id})\n"
         f"📦 {product}\n"
         f"🎯 @{data['target']}\n"
         f"💰 Narx: {money(int(data['amount']))} so'm\n"
@@ -2455,7 +2494,7 @@ async def profile(c: CallbackQuery):
     await c.message.edit_text(
         f"👤 <b>Profil</b>\n\n"
         f"🆔 StarsOson ID: <b>{uid}</b>\n"
-        f"👤 {c.from_user.full_name}\n"
+        f"👤 {esc(c.from_user.full_name)}\n"
         f"🔗 @{c.from_user.username or 'username yo‘q'}\n"
         f"📦 Buyurtmalar: <b>{cnt}</b>\n"
         f"💰 Xaridlar: <b>{money(total)} so'm</b>\n"
@@ -2765,9 +2804,9 @@ async def admin_price_pick(c: CallbackQuery, state: FSMContext):
 async def admin_price_value(m: Message, state: FSMContext):
     if m.from_user.id not in ADMIN_IDS:
         return
-    raw = re.sub(r"\D", "", m.text or "")
-    if not raw:
-        return await m.answer("❌ Narxni faqat raqamda yuboring.")
+    raw = (m.text or "").strip().replace(" ", "")
+    if not re.fullmatch(r"\d+", raw):
+        return await m.answer("❌ Narxni faqat butun raqamda yuboring. Masalan: <code>210</code>")
     value = int(raw)
     if value <= 0:
         return await m.answer("❌ Narx 0 dan katta bo‘lishi kerak.")
@@ -3047,7 +3086,7 @@ async def admin_vip(c: CallbackQuery):
     top_lines = []
     for idx, row in enumerate(rows, 1):
         level, _ = vip_info(int(row[3] or 0))
-        name = row[1] or row[2] or str(row[0])
+        name = esc(row[1] or row[2] or str(row[0]))
         top_lines.append(f"{idx}. {name} — <b>{money(int(row[3] or 0))} so'm</b> — {level}")
 
     await c.message.edit_text(
@@ -3215,7 +3254,7 @@ async def ausers(c: CallbackQuery):
 
         ).fetchall()
 
-    lines = [f"👤 {x[1]} | <code>{x[0]}</code> | @{x[2] or '-'}" for x in rows]
+    lines = [f"👤 {esc(x[1])} | <code>{x[0]}</code> | @{esc(x[2] or '-')}" for x in rows]
 
     await c.message.edit_text(
 
@@ -3299,9 +3338,19 @@ async def main() -> None:
 
     sweeper_task = asyncio.create_task(order_sweeper(bot))
 
-    userbot = await start_userbot(bot)
-
-
+    # CardXabar userbotida muammo bo‘lsa ham asosiy StarsOson bot yiqilmasin.
+    try:
+        userbot = await start_userbot(bot)
+    except Exception:
+        userbot = None
+        log.exception("CardXabar userbot ishga tushmadi; asosiy bot ishlashda davom etadi")
+        try:
+            await admins(
+                bot,
+                "⚠️ <b>Avto-to‘lov ishga tushmadi.</b>\nAsosiy bot ishlayapti, CardXabar sozlamalarini tekshiring.",
+            )
+        except Exception:
+            pass
 
     try:
 
