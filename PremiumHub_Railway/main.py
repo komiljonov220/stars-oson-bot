@@ -1097,11 +1097,14 @@ async def home_text(u) -> str:
 
 
 async def ensure_enabled(c: CallbackQuery) -> bool:
-
     if c.from_user.id in ADMIN_IDS:
-
         return True
 
+    if await setting("bot_enabled", "1") != "1":
+        await c.answer("⛔ Bot vaqtincha texnik xizmatda.", show_alert=True)
+        return False
+
+    return True
 
 
 @router.callback_query(F.data == "sub:check")
@@ -1112,14 +1115,8 @@ async def subscription_check(c: CallbackQuery, bot: Bot):
             reply_markup=main_kb(c.from_user.id in ADMIN_IDS),
         )
         return await c.answer("✅ Obuna tasdiqlandi.")
+
     await c.answer("❌ Hali kanalga obuna bo‘lmagansiz.", show_alert=True)
-    if await setting("bot_enabled", "1") != "1":
-
-        await c.answer("⛔ Bot vaqtincha texnik xizmatda.", show_alert=True)
-
-        return False
-
-    return True
 
 
 
