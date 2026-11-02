@@ -3,4 +3,4 @@ aiohttp>=3.10,<4
 aiosqlite>=0.20,<1
 python-dotenv>=1.0,<2
 telethon>=1.38,<2
-openai>=1.75,<3
+
