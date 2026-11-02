@@ -34,7 +34,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatMemberStatus, ParseMode
 
 from aiogram.exceptions import TelegramRetryAfter
-from aiogram.filters import Command, CommandObject, StateFilter
+from aiogram.filters import Command
 
 from aiogram.fsm.context import FSMContext
 
@@ -47,8 +47,6 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from aiosqlite import connect
 
 from dotenv import load_dotenv
-
-from starsoson_ai import enabled as ai_enabled, reply as ai_reply
 
 
 
@@ -266,7 +264,6 @@ def main_kb(admin: bool = False) -> InlineKeyboardMarkup:
     rows = [
 
         [b("⭐ Stars olish", "menu:stars", "primary")],
-        [b("🤖 AI yordamchi", "menu:ai", "success")],
 
         [
 
@@ -1946,24 +1943,6 @@ async def order_sweeper(bot: Bot) -> None:
 
 # ========================= FOYDALANUVCHI FLOW =========================
 
-@router.message(Command("ai"))
-async def ai_command(m: Message, state: FSMContext, bot: Bot, command: CommandObject):
-    if not m.from_user or m.chat.type != "private":
-        return
-    if await state.get_state() is not None:
-        await m.answer("⚠️ Buyurtma yoki admin jarayoni davom etmoqda. Uni yakunlang yoki Orqaga qayting.")
-        return
-    if await setting("bot_enabled", "1") != "1" and m.from_user.id not in ADMIN_IDS:
-        return await m.answer("⛔ Bot vaqtincha texnik xizmatda.")
-    if not await require_subscription_message(m, bot):
-        return
-    q = (command.args or "").strip()
-    if not q:
-        await m.answer("🤖 StarsOson AI\n\nSavolingizni oddiy matn qilib yozing yoki /ai 100 Stars qanday olinadi? deb yuboring.")
-        return
-    await ai_reply(m, q, await current_star_price(), await current_premium_prices(), SUPPORT_USERNAME)
-
-
 @router.message(Command("start"))
 
 async def start(m: Message, state: FSMContext, bot: Bot):
@@ -2020,28 +1999,6 @@ async def home(c: CallbackQuery, state: FSMContext, bot: Bot):
 
 
 
-
-
-# ====================== MIJOZLAR UCHUN AI ======================
-
-@router.callback_query(F.data == "menu:ai")
-async def ai_menu(c: CallbackQuery, state: FSMContext, bot: Bot):
-    if not await ensure_enabled(c):
-        return
-    if not await require_subscription_callback(c, bot):
-        return
-    if await state.get_state() is not None:
-        return await c.answer("Avval xarid yoki boshqa boshlangan jarayonni yakunlang.", show_alert=True)
-    status = "🟢 Yoqilgan" if ai_enabled() else "🔴 Hozircha o'chirilgan"
-    await c.message.edit_text(
-        "🤖 <b>StarsOson AI yordamchi</b>\n\n"
-        "Stars va Premium, xarid qilish yoki buyurtma bo'yicha savolingizni "
-        "shu chatga oddiy xabar qilib yozing. /ai buyrug'i ham ishlaydi.\n\n"
-        f"Holati: {status}\n\n"
-        "🔒 SMS kod, PIN, CVV va to'liq karta raqamini yubormang.",
-        reply_markup=back(),
-    )
-    await c.answer()
 
 
 @router.callback_query(F.data == "menu:stars")
@@ -3476,26 +3433,6 @@ async def logtest(c: CallbackQuery, bot: Bot):
 
 
 
-
-
-# Oxirgi fallback: avvalgi savdo, admin, FSM va buyurtma xabar handlerlari ustun.
-# AI faqat FSM holati BO'SH bo'lgan oddiy shaxsiy matnni qabul qiladi.
-@router.message(StateFilter(None), F.text)
-async def ai_plain_text(m: Message, bot: Bot):
-    if not m.from_user or m.chat.type != "private":
-        return
-    if not ai_enabled():
-        return  # Yangi API sozlanmaguncha eski bot kabi ishlaydi.
-    text = (m.text or "").strip()
-    if not text or text.startswith("/") or text.startswith("@") or text.isdecimal():
-        return
-    if m.forward_origin is not None:
-        return  # Forward/CardXabar matnini AI'ga avtomatik yubormaymiz.
-    if await setting("bot_enabled", "1") != "1" and m.from_user.id not in ADMIN_IDS:
-        return
-    if not await require_subscription_message(m, bot):
-        return
-    await ai_reply(m, text, await current_star_price(), await current_premium_prices(), SUPPORT_USERNAME)
 
 
 # ========================= START =========================
