@@ -1098,11 +1098,15 @@ async def home_text(u) -> str:
 
 
 async def ensure_enabled(c: CallbackQuery) -> bool:
-
+    """Bot yoqilgan bo'lsa barcha mijozlarga ruxsat beradi; admin har doim kira oladi."""
     if c.from_user.id in ADMIN_IDS:
-
         return True
 
+    if await setting("bot_enabled", "1") != "1":
+        await c.answer("⛔ Bot vaqtincha texnik xizmatda. Keyinroq urinib ko‘ring.", show_alert=True)
+        return False
+
+    return True
 
 
 @router.callback_query(F.data == "sub:check")
